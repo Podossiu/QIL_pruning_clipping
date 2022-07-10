@@ -21,6 +21,7 @@ from ray.tune.suggest.optuna import OptunaSearch
 import optuna
 import wandb
 import matplotlib.pyplot as plt
+
 class MyCallback(TrainerCallback):
     # A callback to wandb for center / distance parameter
 
@@ -48,6 +49,57 @@ class DistillationTrainingArguments(TrainingArguments):
         self.beta = beta
         self.gamma = gamma
 
+class SearchTrainingArguments(TrainingArguments):
+    def __init__(self, *args, search_lr = 1e-2, **kwargs):
+        super().__init__(*args, **kwargs)
+
+        self.search_lr = 1e-2
+
+class SearchTrainer(Trainer):
+    def __init__(self, *args, search_lr = 1e-2, **kwargs):
+        super().__init__(*args, **kwargs)
+
+        self.search_lr = search_lr
+
+    def create_optimizer(self):
+        opt_model = self.model
+
+        if self.optimizer is None:
+            decay_parameters = [name for name, p in self.model.named_parameters() if "LayerNorm" in name]
+            decay_parameters = [name for name in decay_parameters if "bias" not in name]
+            search_parameters = [name for name, p in self.model.named_parameters() if "point" in name]
+            print(search_parameters)
+            optimizer_grouped_parameters = [
+                    {
+                        "params": [p for n, p in opt_model.named_parameters() if n in decay_parameters],
+                        "weight_decay": self.args.weight_decay,
+                    },
+                    {
+                        "params" : [p for n, p in opt_model.named_parameters() if (n not in decay_parameters) and \
+                                (n not in search_parameters)],
+                        "weight_decay" : 0.0,
+                    },
+                    {
+                        "params" : [p for n, p in opt_model.named_parameters() if n in search_parameters],
+                        "lr" : self.search_lr,
+                        "weight_decay" : 0.0,
+                    }
+                ]
+            optimizer_cls, optimizer_kwargs = Trainer.get_optimizer_cls_and_kwargs(self.args)
+            self.optimizer = optimizer_cls(optimizer_grouped_parameters, **optimizer_kwargs)
+
+            if optimizer_cls.__name__ == "Adam8bit":
+                import bitsandbytes
+
+                manager = bitsandbytes.optim.GlobalOptimManager.get_instance()
+
+                for module in opt_model.modules():
+                    if isinstance(module, nn.Embedding):
+                        manager.register_module_override(module, "weight", {"optim_bits": 32})
+                        logger.debug(f"bitsandbytes: will optimize {module} in fp32")
+
+        return self.optimizer
+
 class DistillationTrainer(Trainer):
     def __init__(self, *args, teacher_model = None, **kwargs):
         super().__init__(*args, **kwargs)
@@ -71,18 +123,24 @@ class DistillationTrainer(Trainer):
         loss_logits = (loss_function(
             F.log_softmax(outputs_student.logits / self.args.temperature, dim = -1),
             F.softmax(outputs_teacher.logits / self.args.temperature, dim = -1)) * (self.args.temperature ** 2))
-        
+
         attention_hidden_loss_function = nn.MSELoss()
         loss_attentions = 0.0
         loss_hiddens = 0.0
         for (attention_student, attention_teacher) in zip(outputs_student.attentions,outputs_teacher.attentions):
+            #loss_attentions += attention_hidden_loss_function(attention_student, attention_teacher) / attention_student.shape[1]
             loss_attentions += attention_hidden_loss_function(attention_student, attention_teacher) / attention_student.shape[1]
-
         for (hidden_student, hidden_teacher) in zip(outputs_student.hidden_states, outputs_teacher.hidden_states):
             loss_hiddens += attention_hidden_loss_function(hidden_student, hidden_teacher)
 
+        #print(loss_logits, loss_attentions, loss_hiddens, student_loss)
+        #input()
         # beta : hidden, gamma : attention
-        loss = self.args.alpha * student_loss + ( 1. - self.args.alpha) * loss_logits + self.args.beta * loss_hiddens + self.args.gamma * loss_attentions
+        loss = loss_attentions + loss_logits + loss_hiddens + student_loss
+        loss = loss.mean()
+        #print(loss)
+        #input()
+        print(loss)
         return (loss, outputs_student) if return_outputs else loss
 
 def arg_parse():
@@ -106,7 +164,8 @@ def arg_parse():
     parser.add_argument('--group_wise', action = 'store_true')
     parser.add_argument('--num_groups', default = 12, type = int)
     parser.add_argument('--embedding_bit','-e', default = 8, type = int)
-    parser.add_argument('--bitsearch', action = 'store_true')
+    parser.add_argument('--search', action = 'store_true')
+    parser.add_argument('--search_lr', '-sl', default = 1e-2, type = float)
     args = parser.parse_args()
     return args
 
@@ -151,9 +210,9 @@ def get_teacher_model():
     return teacher_model
 
 def get_model(config):
-    bert_config = QILBertConfig(weight_bit = config['weight_bit'] if (config is not None) and "weight_bit" in config else args.weight_bit, act_bit = args.act_bit, embedding_bit = args.embedding_bit, group_wise = args.group_wise, 
-            num_groups = args.num_groups, quant_mode = args.quant_mode)
-    print(bert_config.weight_bit)
+
+    bert_config = QILBertConfig(weight_bit = args.weight_bit, act_bit = args.act_bit, embedding_bit = args.embedding_bit, group_wise = args.group_wise, num_groups = args.num_groups,
+                                quant_mode = args.quant_mode)
     if args.quant_mode:
         model = QILBertForSequenceClassification(bert_config)
         check_point = torch.load(os.path.join(args.directory, 'pytorch_model.bin'))
@@ -262,21 +321,21 @@ def layer_norm_calibration(valid_dataloader, model):
 def get_param_space():
     if args.distillation:
         space = {
-                "learning_rate" : tune.grid_search([1e-5,3e-5, 5e-5, 1e-6, 2e-6, 3e-6]),
+                "learning_rate" : tune.grid_search([3e-5, 5e-5, 1e-6, 2e-6, 3e-6]),
                 "per_device_train_batch_size" : tune.grid_search([16]),
-                "alpha" : tune.uniform(0.1, 0.9),
-                "temperature": tune.randint(1, 5),
-                "beta" : tune.uniform(0.01, 1),
-                "gamma": tune.uniform(0.1, 1),
+                #"alpha" : tune.uniform(0.5, 0.9),
+                #"temperature": tune.randint(1, 2),
+                #"beta" : tune.uniform(0.1, 1),
+                #"gamma": tune.uniform(0.1, 1),
                 }
-    elif args.bitsearch:
+    elif args.search:
         space = {
-                "learning_rate" : tune.grid_search([1e-4, 1e-5, 3e-5, 3e-4, 5e-4]),
-                "weight_bit" : tune.grid_search([8, 7, 6, 5, 4])
-            }
+                "learning_rate" : tune.choice([1e-6, 2e-6, 3e-6, 5e-6, 1e-5, 3e-5]),
+                "search_lr" : tune.choice([1e-3, 1e-4,1e-5, 1e-6])
+                }
     else :
         space = {
-                "learning_rate" : tune.grid_search([1e-4, 1e-5, 3e-5]),
+                "learning_rate" : tune.grid_search([3e-5, 5e-5, 1e-4]),
                 "per_device_train_batch_size" : tune.grid_search([16]),
                 }
     return space
@@ -361,7 +420,7 @@ if __name__ == "__main__":
         trainer.hyperparameter_search(
                     hp_space = lambda _ : space,
                     compute_objective = objective_metric,
-                    n_trials = 20,
+                    n_trials = 1,
                     direction = "maximize",
                     backend = "ray",
                     resources_per_trial = {"cpu": 16, "gpu" : 2}
@@ -400,6 +459,11 @@ if __name__ == "__main__":
                 model.zero_grad()
 
                 progress_bar.update(1)
+    elif args.weight_plot:
+        model = get_model(None).to(device)
+        for name, m in model.named_modules():
+            if hasattr(m, "bitW"):
+                m.weight_plot(name)
     elif args.print_percentage:
         model = get_model(None).to(device)
         for name, m in model.named_modules():
@@ -411,13 +475,53 @@ if __name__ == "__main__":
         for name, m in model.named_modules():
             if hasattr(m, "box_plot"):
                 m.box_plot(name)
-    elif args.weight_plot:
-        model = get_model(None).to("cpu")
-        for name, m in model.named_modules():
-            if hasattr(m, "weight_quantize"):
-                plt.hist(m.weight.detach(), bins = 100)
-                plt.hist(m.weight_quantize.detach(), bins = 100)
-                plt.show()
+    elif args.search:
+        training_args = SearchTrainingArguments(
+                experiment,
+                per_device_train_batch_size = 16, 
+                per_device_eval_batch_size = 16, 
+                evaluation_strategy = "steps", 
+                learning_rate = 5e-7,
+                eval_steps = 100, 
+                do_train = True, 
+                do_eval = True, 
+                weight_decay = 0.1, 
+                adam_beta1 = 0.9, 
+                adam_beta2 = 0.98, 
+                adam_epsilon = 1e-06, 
+                lr_scheduler_type = "linear", 
+                warmup_ratio = 0.06, 
+                logging_strategy = "steps", 
+                logging_dir = "./test/" + str(time.time()) + "/log", 
+                logging_steps=20, 
+                save_strategy = "steps", 
+                save_steps =100, 
+                save_total_limit = 1, 
+                load_best_model_at_end = True, 
+                metric_for_best_model = "eval_matthews_correlation", 
+                greater_is_better = True, 
+                num_train_epochs = args.epochs,
+                search_lr = args.search_lr,
+                )
+        trainer = SearchTrainer(
+                    args = training_args,
+                    tokenizer = tokenizer,
+                    search_lr = args.search_lr,
+                    train_dataset = encoded_dataset['train'],
+                    eval_dataset = encoded_dataset['validation'],
+                    model_init = get_model,
+                    compute_metrics = compute_metrics
+                    )
+        trainer.add_callback(MyCallback)
+        trainer.hyperparameter_search(
+                    hp_space = lambda _ : space,
+                    compute_objective = objective_metric,
+                    n_trials = 30,
+                    direction = "maximize",
+                    backend = "ray",
+                    resources_per_trial = {"cpu": 8, "gpu" : 1}
+                    )
+        
     else:
         training_args = TrainingArguments(
                 experiment,
